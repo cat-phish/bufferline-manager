@@ -4,6 +4,7 @@ local M = {}
 M.manager_buf = nil
 M.manager_win = nil
 M.origin_win = nil
+M.buffer_order = {}
 
 -- Default config
 M.config = {
@@ -15,6 +16,7 @@ M.config = {
 	show_numbers = true,
 	use_relative = nil,
 	show_bufnr = true,
+	confirm_delete = true,
 	keymaps = {
 		delete = "dd",
 		move_down = "<A-j>",
@@ -25,7 +27,6 @@ M.config = {
 	},
 }
 
--- Setup function
 function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
@@ -61,24 +62,6 @@ local function get_bufferline_order()
 	return vim.fn.getbufinfo({ buflisted = 1 })
 end
 
-local function parse_bufnr_from_line(line)
-	if M.config.show_bufnr then
-		-- Parse from "123: filename" format
-		local bufnr = line:match("^(%d+):")
-		return tonumber(bufnr)
-	else
-		-- When show_bufnr is false store line index instead
-		return nil
-	end
-end
-
-local function get_buffer_list()
-	if not M.manager_buf or not api.nvim_buf_is_valid(M.manager_buf) then
-		return {}
-	end
-	return api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
-end
-
 local function format_buffer_name(bufnr, name)
 	local display_name
 	if name == "" then
@@ -103,10 +86,12 @@ local function refresh_display()
 
 	local buffers = get_bufferline_order()
 	local buf_lines = {}
+	M.buffer_order = {}
 
 	for _, b in ipairs(buffers) do
 		local display_name = format_buffer_name(b.bufnr, b.name)
 		table.insert(buf_lines, display_name)
+		table.insert(M.buffer_order, b.bufnr)
 	end
 
 	local cursor_pos = api.nvim_win_get_cursor(M.manager_win)
@@ -128,21 +113,20 @@ function M.delete_line()
 
 	local cursor = api.nvim_win_get_cursor(M.manager_win)
 	local line_num = cursor[1]
-	local lines = get_buffer_list()
 
-	if line_num > #lines then
-		return
-	end
-
-	local bufnr = parse_bufnr_from_line(lines[line_num])
+	local bufnr = M.buffer_order[line_num]
 	if bufnr then
-		local bufname = vim.fn.bufname(bufnr)
-		local display_name = bufname ~= "" and bufname or "[No Name]"
-		local choice = vim.fn.confirm("Delete buffer " .. bufnr .. ": " .. display_name .. "?", "&Yes\n&No", 2)
-		if choice == 1 then
-			pcall(vim.cmd, "bdelete " .. bufnr)
-			vim.defer_fn(refresh_display, 50)
+		if M.config.confirm_delete then
+			local bufname = vim.fn.bufname(bufnr)
+			local display_name = bufname ~= "" and bufname or "[No Name]"
+			local choice = vim.fn.confirm("Delete buffer " .. bufnr .. ": " .. display_name .. "?", "&Yes\n&No", 2)
+			if choice ~= 1 then
+				return
+			end
 		end
+
+		pcall(vim.cmd, "bdelete " .. bufnr)
+		vim.defer_fn(refresh_display, 50)
 	end
 end
 
@@ -153,13 +137,12 @@ function M.move_line_down()
 
 	local cursor = api.nvim_win_get_cursor(M.manager_win)
 	local line_num = cursor[1]
-	local lines = get_buffer_list()
 
-	if line_num >= #lines then
+	if line_num >= #M.buffer_order then
 		return
 	end
 
-	local bufnr = parse_bufnr_from_line(lines[line_num])
+	local bufnr = M.buffer_order[line_num]
 	if bufnr then
 		if M.origin_win and api.nvim_win_is_valid(M.origin_win) then
 			vim.fn.win_execute(M.origin_win, "buffer " .. bufnr)
@@ -169,7 +152,7 @@ function M.move_line_down()
 		vim.defer_fn(function()
 			refresh_display()
 			if api.nvim_win_is_valid(M.manager_win) then
-				cursor[1] = math.min(cursor[1] + 1, #lines)
+				cursor[1] = math.min(cursor[1] + 1, #M.buffer_order)
 				pcall(api.nvim_win_set_cursor, M.manager_win, cursor)
 			end
 		end, 50)
@@ -188,9 +171,7 @@ function M.move_line_up()
 		return
 	end
 
-	local lines = get_buffer_list()
-	local bufnr = parse_bufnr_from_line(lines[line_num])
-
+	local bufnr = M.buffer_order[line_num]
 	if bufnr then
 		if M.origin_win and api.nvim_win_is_valid(M.origin_win) then
 			vim.fn.win_execute(M.origin_win, "buffer " .. bufnr)
@@ -213,8 +194,7 @@ function M.jump_to_buffer()
 	end
 
 	local cursor = api.nvim_win_get_cursor(M.manager_win)
-	local lines = get_buffer_list()
-	local bufnr = parse_bufnr_from_line(lines[cursor[1]])
+	local bufnr = M.buffer_order[cursor[1]]
 
 	if bufnr then
 		if M.manager_win and api.nvim_win_is_valid(M.manager_win) then
@@ -243,10 +223,12 @@ function M.open()
 
 	local buffers = get_bufferline_order()
 	local buf_lines = {}
+	M.buffer_order = {}
 
 	for _, b in ipairs(buffers) do
 		local display_name = format_buffer_name(b.bufnr, b.name)
 		table.insert(buf_lines, display_name)
+		table.insert(M.buffer_order, b.bufnr)
 	end
 
 	M.manager_buf = api.nvim_create_buf(false, true)
