@@ -5,7 +5,11 @@ M.manager_buf = nil
 M.manager_win = nil
 M.origin_win = nil
 M.buffer_order = {}
+M.deleted_buffers = {}
 M.is_refreshing = false
+
+M.undo_stack = {}
+M.redo_stack = {}
 
 -- Default config
 M.config = {
@@ -17,7 +21,6 @@ M.config = {
 	smart_path = true,
 	show_numbers = true,
 	use_relative = nil,
-	show_bufnr = true,
 	confirm_delete = true,
 	keymaps = {
 		delete = "dd",
@@ -90,28 +93,78 @@ local function get_duplicate_names(buffers)
 	return duplicates
 end
 
-local function format_buffer_name(bufnr, name)
-	local display_name
-	if name == "" then
-		display_name = "[No Name]"
-	elseif M.config.show_full_path then
-		display_name = name
-	else
-		display_name = vim.fn.fnamemodify(name, ":t")
+local function get_minimum_unique_path(target_path, all_paths)
+	local target_parts = vim.split(vim.fn.fnamemodify(target_path, ":h"), "/", { plain = true })
+
+	-- Parent directory
+	for depth = 1, #target_parts do
+		local candidate = table.concat(vim.list_slice(target_parts, #target_parts - depth + 1), "/")
+
+		-- Check if unique
+		local is_unique = true
+		for _, other_path in ipairs(all_paths) do
+			if other_path ~= target_path then
+				local other_parts = vim.split(vim.fn.fnamemodify(other_path, ":h"), "/", { plain = true })
+				local other_candidate =
+					table.concat(vim.list_slice(other_parts, math.max(1, #other_parts - depth + 1)), "/")
+
+				if candidate == other_candidate then
+					is_unique = false
+					break
+				end
+			end
+		end
+
+		if is_unique then
+			return candidate
+		end
 	end
 
-	if M.config.show_bufnr then
-		return string.format("%d: %s", bufnr, display_name)
+	-- If not unique, return full path minus home
+	local full = vim.fn.fnamemodify(target_path, ":h")
+	return full:gsub("^" .. vim.fn.expand("~"), "~")
+end
+
+local function format_buffer_name(bufnr, name)
+	if name == "" then
+		return "[No Name]"
+	elseif M.config.show_full_path then
+		return name
 	else
-		return display_name
+		return vim.fn.fnamemodify(name, ":t")
 	end
 end
+
 local function apply_smart_path_decorations(buffers)
 	if not M.config.smart_path or not M.manager_buf or not api.nvim_buf_is_valid(M.manager_buf) then
 		return
 	end
 
 	local duplicates = get_duplicate_names(buffers)
+
+	-- For dupe filenames, calc  min unique path
+	local unique_paths = {}
+	for _, b in ipairs(buffers) do
+		if b.name ~= "" then
+			local basename = vim.fn.fnamemodify(b.name, ":t")
+			if duplicates[basename] then
+				if not unique_paths[basename] then
+					unique_paths[basename] = {}
+				end
+				table.insert(unique_paths[basename], b.name)
+			end
+		end
+	end
+
+	-- Calc min distinguishing paths
+	local display_paths = {}
+	for basename, paths in pairs(unique_paths) do
+		for _, full_path in ipairs(paths) do
+			-- Start with parent, expand until unique
+			local min_path = get_minimum_unique_path(full_path, paths)
+			display_paths[full_path] = min_path
+		end
+	end
 
 	-- Clear existing virtual text
 	local ns_id = api.nvim_create_namespace("bufferline_manager_smart_path")
@@ -120,11 +173,10 @@ local function apply_smart_path_decorations(buffers)
 	for i, b in ipairs(buffers) do
 		if b.name ~= "" then
 			local basename = vim.fn.fnamemodify(b.name, ":t")
-			if duplicates[basename] then
-				local parent = vim.fn.fnamemodify(b.name, ":h:t")
-				-- Add virtual text showing parent folder before the filename
+			if duplicates[basename] and display_paths[b.name] then
+				-- Add unique path virtual text
 				api.nvim_buf_set_extmark(M.manager_buf, ns_id, i - 1, 0, {
-					virt_text = { { parent .. "/", "Comment" } },
+					virt_text = { { display_paths[b.name] .. "/", "Comment" } },
 					virt_text_pos = "inline",
 					right_gravity = false,
 				})
@@ -134,13 +186,46 @@ local function apply_smart_path_decorations(buffers)
 end
 
 local function extract_filename(line)
-	if M.config.show_bufnr then
-		-- Extract from "123: filename" format
-		local filename = line:match("^%d+:%s*(.+)$")
-		return filename
-	else
-		return line
+	return line
+end
+
+local function has_unsaved_changes()
+	if not M.manager_buf or not api.nvim_buf_is_valid(M.manager_buf) then
+		return false
 	end
+
+	local lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
+
+	for i, line in ipairs(lines) do
+		local bufnr = M.buffer_order[i]
+		if bufnr and api.nvim_buf_is_valid(bufnr) then
+			local new_name = extract_filename(line)
+			local old_name = vim.fn.bufname(bufnr)
+			local old_display = old_name ~= "" and vim.fn.fnamemodify(old_name, ":t") or "[No Name]"
+
+			if new_name and new_name ~= old_display and new_name ~= "[No Name]" then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+local function update_window_title()
+	if not M.manager_win or not api.nvim_win_is_valid(M.manager_win) then
+		return
+	end
+
+	local title = M.config.title
+	if has_unsaved_changes() then
+		title = M.config.title .. " [+]"
+	end
+
+	pcall(api.nvim_win_set_config, M.manager_win, {
+		title = title,
+		title_pos = "center",
+	})
 end
 
 local function get_pending_changes()
@@ -168,6 +253,78 @@ local function get_pending_changes()
 	end
 
 	return changes
+end
+
+local function smart_undo()
+	-- Check if we have a deleted buffer to restore
+	if #M.deleted_buffers > 0 then
+		local deleted = table.remove(M.deleted_buffers)
+
+		-- Restore the buffer
+		local new_bufnr = api.nvim_create_buf(true, false)
+
+		-- Restore buffer name
+		if deleted.name and deleted.name ~= "" then
+			pcall(api.nvim_buf_set_name, new_bufnr, deleted.name)
+		end
+
+		-- Restore buffer content
+		api.nvim_buf_set_lines(new_bufnr, 0, -1, false, deleted.content)
+		vim.bo[new_bufnr].modified = deleted.modified
+
+		-- Move buffer to correct position using bufferline
+		if M.origin_win and api.nvim_win_is_valid(M.origin_win) then
+			-- Switch to the new buffer
+			vim.fn.win_execute(M.origin_win, "buffer " .. new_bufnr)
+
+			-- Move to position
+			for i = 1, 100 do
+				vim.fn.win_execute(M.origin_win, "BufferLineMovePrev")
+			end
+
+			-- Then move it forward to the target position
+			for i = 1, deleted.position - 1 do
+				vim.fn.win_execute(M.origin_win, "BufferLineMoveNext")
+			end
+		end
+
+		vim.notify("Restored buffer: " .. (deleted.name ~= "" and deleted.name or "[No Name]"), vim.log.levels.INFO)
+
+		-- Refresh to show the restored buffer
+		vim.defer_fn(M.refresh_display, 100)
+		return
+	end
+
+	-- If no deleted buffers, try text undo
+	local before_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
+	local before_count = #before_lines
+
+	vim.cmd("silent! undo")
+
+	local after_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
+	local after_count = #after_lines
+
+	-- If line count changed, redo to cancel
+	if after_count ~= before_count then
+		vim.cmd("silent! redo")
+		vim.notify("Nothing to undo", vim.log.levels.WARN)
+	end
+end
+
+local function smart_redo()
+	local before_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
+	local before_count = #before_lines
+
+	vim.cmd("silent! redo")
+
+	local after_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
+	local after_count = #after_lines
+
+	-- If line count changed, undo to cancel the redo
+	if after_count ~= before_count then
+		vim.cmd("silent! undo")
+		vim.notify("Cannot redo line operations", vim.log.levels.WARN)
+	end
 end
 
 function M.save_changes()
@@ -263,7 +420,9 @@ function M.save_changes()
 		vim.notify("No changes to save", vim.log.levels.INFO)
 	end
 
-	-- Mark the manager buffer as unmodified
+	-- Update title to remove the [+] indicator
+	update_window_title()
+
 	vim.bo[M.manager_buf].modified = false
 end
 
@@ -278,12 +437,34 @@ function M.refresh_display()
 
 	M.is_refreshing = true
 
+	-- Save current lines to preserve edits
+	local current_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
+	local edited_lines = {}
+
+	-- Check which lines were edited
+	for i, line in ipairs(current_lines) do
+		local bufnr = M.buffer_order[i]
+		if bufnr and api.nvim_buf_is_valid(bufnr) then
+			local expected = format_buffer_name(bufnr, vim.fn.bufname(bufnr))
+			if line ~= expected then
+				-- This line was edited, preserve it
+				edited_lines[bufnr] = line
+			end
+		end
+	end
+
 	local buffers = get_bufferline_order()
 	local buf_lines = {}
 	M.buffer_order = {}
 
 	for _, b in ipairs(buffers) do
-		local display_name = format_buffer_name(b.bufnr, b.name)
+		-- Use edited line if exists, otherwise use formatted name
+		local display_name
+		if edited_lines[b.bufnr] then
+			display_name = edited_lines[b.bufnr]
+		else
+			display_name = format_buffer_name(b.bufnr, b.name)
+		end
 		table.insert(buf_lines, display_name)
 		table.insert(M.buffer_order, b.bufnr)
 	end
@@ -291,6 +472,7 @@ function M.refresh_display()
 	local cursor_pos = api.nvim_win_get_cursor(M.manager_win)
 	api.nvim_buf_set_lines(M.manager_buf, 0, -1, false, buf_lines)
 
+	-- Apply virtual text for duple filenames
 	apply_smart_path_decorations(buffers)
 
 	if api.nvim_win_is_valid(M.manager_win) then
@@ -298,6 +480,9 @@ function M.refresh_display()
 		cursor_pos[1] = math.max(cursor_pos[1], 1)
 		pcall(api.nvim_win_set_cursor, M.manager_win, cursor_pos)
 	end
+
+	-- Update window title to show unsaved changes
+	update_window_title()
 
 	M.is_refreshing = false
 end
@@ -321,6 +506,48 @@ function M.delete_line()
 			end
 		end
 
+		-- Store buffer info before deleting for potential undo
+		local buf_info = {
+			bufnr = bufnr,
+			name = vim.fn.bufname(bufnr),
+			position = line_num,
+			content = api.nvim_buf_get_lines(bufnr, 0, -1, false),
+			modified = vim.bo[bufnr].modified,
+		}
+		table.insert(M.deleted_buffers, buf_info)
+
+		-- Check if this is the current buffer in origin window
+		local is_current = false
+		if M.origin_win and api.nvim_win_is_valid(M.origin_win) then
+			local current_buf = api.nvim_win_get_buf(M.origin_win)
+			is_current = (current_buf == bufnr)
+		end
+
+		-- If deleting current buffer, switch to another buffer first
+		if is_current then
+			-- Find another buffer to switch to
+			local next_bufnr = nil
+
+			-- Try next buffer first
+			if line_num < #M.buffer_order then
+				next_bufnr = M.buffer_order[line_num + 1]
+			elseif line_num > 1 then
+				-- If last buffer, try previous
+				next_bufnr = M.buffer_order[line_num - 1]
+			end
+
+			-- Switch to alternate buffer before deleting
+			if
+				next_bufnr
+				and api.nvim_buf_is_valid(next_bufnr)
+				and M.origin_win
+				and api.nvim_win_is_valid(M.origin_win)
+			then
+				vim.fn.win_execute(M.origin_win, "buffer " .. next_bufnr)
+			end
+		end
+
+		-- Delete buffer
 		pcall(vim.cmd, "bdelete " .. bufnr)
 		vim.defer_fn(M.refresh_display, 50)
 	end
@@ -391,7 +618,6 @@ function M.jump_to_buffer()
 
 	local cursor = api.nvim_win_get_cursor(M.manager_win)
 	local bufnr = M.buffer_order[cursor[1]]
-
 	if bufnr then
 		if M.manager_win and api.nvim_win_is_valid(M.manager_win) then
 			api.nvim_win_close(M.manager_win, true)
@@ -427,7 +653,6 @@ function M.close()
 		end
 	end
 
-	-- Close the window
 	if M.manager_win and api.nvim_win_is_valid(M.manager_win) then
 		api.nvim_win_close(M.manager_win, true)
 	end
@@ -440,6 +665,7 @@ end
 
 function M.open()
 	M.origin_win = api.nvim_get_current_win()
+	M.deleted_buffers = {}
 
 	local buffers = get_bufferline_order()
 	local buf_lines = {}
@@ -458,6 +684,14 @@ function M.open()
 	vim.bo[M.manager_buf].bufhidden = "wipe"
 	vim.bo[M.manager_buf].modifiable = true
 	vim.bo[M.manager_buf].filetype = "bufferline-manager"
+
+	-- Clear undo history to prevent 'u' from undoing to empty state
+	vim.api.nvim_buf_call(M.manager_buf, function()
+		local old_undolevels = vim.bo.undolevels
+		vim.bo.undolevels = -1
+		vim.cmd([[execute "normal! a \<BS>\<Esc>"]])
+		vim.bo.undolevels = old_undolevels
+	end)
 
 	local width = math.min(M.config.width, math.floor(vim.o.columns * 0.8))
 	local height = math.min(M.config.height, #buf_lines + 2)
@@ -479,7 +713,7 @@ function M.open()
 	vim.wo[M.manager_win].cursorline = true
 	vim.wo[M.manager_win].number = true
 
-	-- Handle line numbers
+	-- Handle line number settings
 	if M.config.show_numbers then
 		vim.wo[M.manager_win].number = true
 
@@ -497,9 +731,10 @@ function M.open()
 		vim.wo[M.manager_win].relativenumber = false
 	end
 
+	-- Apply virtual text for dupe filenames
 	apply_smart_path_decorations(buffers)
 
-	-- Prevent adding/deleting lines safety net
+	-- Handle text changes and undo/redo
 	vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
 		buffer = M.manager_buf,
 		callback = function()
@@ -510,29 +745,51 @@ function M.open()
 			local current_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
 			local expected_count = #M.buffer_order
 
+			-- Check if line count changed
 			if #current_lines ~= expected_count then
-				vim.notify(
-					"Cannot add or delete lines. Use '" .. M.config.keymaps.delete .. "' to delete buffers.",
-					vim.log.levels.WARN
-				)
-				M.refresh_display()
+				-- Check if undo is trying to restore a deleted buffer's line
+				if #current_lines > expected_count then
+					-- Lines were added (likely from undo)
+					-- Refresh to the current state - don't allow undo of deletions
+					vim.notify("Cannot undo buffer deletion. Buffer is already closed.", vim.log.levels.WARN)
+					M.refresh_display()
+				elseif #current_lines < expected_count then
+					-- Lines were removed (not through dd)
+					vim.notify(
+						"Cannot delete lines directly. Use '" .. M.config.keymaps.delete .. "' to delete buffers.",
+						vim.log.levels.WARN
+					)
+					M.refresh_display()
+				end
+			else
+				-- Line count is correct, update title for potential renames
+				update_window_title()
 			end
 		end,
 	})
 
-	-- BufWriteCmd for :w to save changes
+	-- Set up BufWriteCmd for :w to save changes
 	vim.api.nvim_create_autocmd("BufWriteCmd", {
 		buffer = M.manager_buf,
 		callback = function()
 			M.save_changes()
-			-- Prevent "No file name" error
+			-- Prevent the "No file name" error
 			vim.bo[M.manager_buf].modified = false
+		end,
+	})
+
+	vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+		buffer = M.manager_buf,
+		callback = function()
+			if not M.is_refreshing then
+				update_window_title()
+			end
 		end,
 	})
 
 	local opts_key = { noremap = true, silent = true, buffer = M.manager_buf }
 
-	--TODO: not actually necessary because of how we save now
+	--TODO: not actually necessary because of how we save now and check for errors now
 	-- Block line deletion commands (use dd keymap instead)
 	-- local block_delete_keys = { "d", "D", "x", "X", "s", "S" }
 	-- for _, key in ipairs(block_delete_keys) do
@@ -542,36 +799,32 @@ function M.open()
 	-- end
 
 	-- Block change commands that would delete
-	vim.keymap.set("n", "c", function()
-		vim.notify("Use 'cw' or 'C' to edit buffer name", vim.log.levels.WARN)
-	end, vim.tbl_extend("force", opts_key, { desc = "Blocked - use cw or C" }))
+	-- vim.keymap.set("n", "c", function()
+	-- 	vim.notify("Use 'cw' or 'C' to edit buffer name", vim.log.levels.WARN)
+	-- end, vim.tbl_extend("force", opts_key, { desc = "Blocked - use cw or C" }))
 
 	-- Block visual mode deletion
-	vim.keymap.set("v", "d", function()
-		vim.notify("Cannot delete lines. Use '" .. M.config.keymaps.delete .. "' in normal mode", vim.log.levels.WARN)
-	end, vim.tbl_extend("force", opts_key, { desc = "Blocked" }))
+	-- vim.keymap.set("v", "d", function()
+	-- 	vim.notify("Cannot delete lines. Use '" .. M.config.keymaps.delete .. "' in normal mode", vim.log.levels.WARN)
+	-- end, vim.tbl_extend("force", opts_key, { desc = "Blocked" }))
 
-	vim.keymap.set("v", "c", function()
-		vim.notify("Cannot delete lines. Use '" .. M.config.keymaps.delete .. "' in normal mode", vim.log.levels.WARN)
-	end, vim.tbl_extend("force", opts_key, { desc = "Blocked" }))
+	-- vim.keymap.set("v", "c", function()
+	-- 	vim.notify("Cannot delete lines. Use '" .. M.config.keymaps.delete .. "' in normal mode", vim.log.levels.WARN)
+	-- end, vim.tbl_extend("force", opts_key, { desc = "Blocked" }))
 
-	-- Block new line commands
+	-- Allow editing with cw and C
+	-- vim.keymap.set("n", "cw", "0C", vim.tbl_extend("force", opts_key, { desc = "Edit buffer name" }))
+	-- vim.keymap.set("n", "C", "0C", vim.tbl_extend("force", opts_key, { desc = "Edit buffer name" }))
+
+	-- Block new line below
 	vim.keymap.set("n", "o", function()
 		vim.notify("Cannot add new buffers here", vim.log.levels.WARN)
 	end, vim.tbl_extend("force", opts_key, { desc = "Blocked" }))
 
+	-- Block new line above
 	vim.keymap.set("n", "O", function()
 		vim.notify("Cannot add new buffers here", vim.log.levels.WARN)
 	end, vim.tbl_extend("force", opts_key, { desc = "Blocked" }))
-
-	-- Allow editing with cw and C (skip bufnr prefix if present)
-	if M.config.show_bufnr then
-		vim.keymap.set("n", "cw", "0f:2lC", vim.tbl_extend("force", opts_key, { desc = "Edit buffer name" }))
-		vim.keymap.set("n", "C", "0f:2lC", vim.tbl_extend("force", opts_key, { desc = "Edit buffer name" }))
-	else
-		vim.keymap.set("n", "cw", "0C", vim.tbl_extend("force", opts_key, { desc = "Edit buffer name" }))
-		vim.keymap.set("n", "C", "0C", vim.tbl_extend("force", opts_key, { desc = "Edit buffer name" }))
-	end
 
 	-- Delete keymap
 	vim.keymap.set("n", M.config.keymaps.delete, function()
@@ -592,6 +845,15 @@ function M.open()
 	vim.keymap.set("n", M.config.keymaps.jump, function()
 		M.jump_to_buffer()
 	end, vim.tbl_extend("force", opts_key, { desc = "Jump to buffer" }))
+
+	-- Smart undo that only works for text changes, not line changes
+	vim.keymap.set("n", "u", function()
+		smart_undo()
+	end, vim.tbl_extend("force", opts_key, { desc = "Smart undo (text only)" }))
+
+	vim.keymap.set("n", "<C-r>", function()
+		smart_redo()
+	end, vim.tbl_extend("force", opts_key, { desc = "Smart redo (text only)" }))
 
 	-- Close keymaps
 	local close_keys = type(M.config.keymaps.close) == "table" and M.config.keymaps.close or { M.config.keymaps.close }
@@ -617,7 +879,7 @@ function M.open()
 		M.save_changes()
 	end, vim.tbl_extend("force", opts_key, { desc = "Save changes" }))
 
-	-- Make :w call save_changes (cabbrev approach)
+	-- Make :w call save_changes
 	vim.api.nvim_create_autocmd("CmdlineEnter", {
 		buffer = M.manager_buf,
 		callback = function()
