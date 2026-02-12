@@ -6,6 +6,7 @@ M.manager_win = nil
 M.origin_win = nil
 M.buffer_order = {}
 M.deleted_buffers = {}
+M.move_history = {}
 M.is_refreshing = false
 
 -- Default config
@@ -19,13 +20,16 @@ M.config = {
 	show_numbers = true,
 	use_relative = nil,
 	confirm_delete = true,
+	confirm_save = true,
+	auto_save_on_exit_insert = false,
 	keymaps = {
 		delete = "dd",
 		move_down = "<A-j>",
 		move_up = "<A-k>",
 		jump = "<CR>",
 		close = { "q", "<Esc>" },
-		refresh = "r",
+		-- TODO: remove this?
+		-- refresh = "r",
 		save = "<C-s>",
 	},
 }
@@ -144,7 +148,7 @@ local function apply_smart_path_decorations()
 	local lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
 	local name_counts = {}
 
-	-- Identify duplicatesn
+	-- Identify dupes
 	for _, line in ipairs(lines) do
 		if line ~= "" and line ~= "[No Name]" then
 			name_counts[line] = (name_counts[line] or 0) + 1
@@ -250,15 +254,85 @@ local function get_pending_changes()
 	return changes
 end
 
+local function apply_move_to_bufferline(from_pos, direction)
+	local bufnr = M.buffer_order[from_pos]
+	if not bufnr or not M.origin_win or not api.nvim_win_is_valid(M.origin_win) then
+		return false
+	end
+
+	vim.fn.win_execute(M.origin_win, "buffer " .. bufnr)
+	if direction == "down" then
+		vim.fn.win_execute(M.origin_win, "BufferLineMoveNext")
+	else
+		vim.fn.win_execute(M.origin_win, "BufferLineMovePrev")
+	end
+
+	return true
+end
+
+local function find_swap(before_lines, after_lines, before_order)
+	if #before_lines ~= #after_lines then
+		return nil
+	end
+
+	for i = 1, #after_lines - 1 do
+		if before_lines[i] ~= after_lines[i] and before_lines[i + 1] ~= after_lines[i + 1] then
+			if before_lines[i] == after_lines[i + 1] and before_lines[i + 1] == after_lines[i] then
+				-- Found swap at position i and i+1
+				-- Track which buffer number was at each position
+				return {
+					pos1 = i,
+					pos2 = i + 1,
+					line1 = after_lines[i],
+					line2 = after_lines[i + 1],
+					bufnr_at_pos1_before = before_order[i],
+					bufnr_at_pos2_before = before_order[i + 1],
+				}
+			end
+		end
+	end
+
+	return nil
+end
+
 local function smart_undo()
+	-- Capture state before undo
 	local before_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
-	local before_count = #before_lines
+	local before_order = vim.deepcopy(M.buffer_order)
 
 	vim.cmd("silent! undo")
 
 	local after_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
+	local before_count = #before_lines
 	local after_count = #after_lines
 
+	-- Check if undoing a move operation
+	if before_count == after_count and #M.move_history > 0 then
+		local swap = find_swap(before_lines, after_lines, before_order)
+
+		if swap then
+			local last_move = table.remove(M.move_history)
+
+			-- Swap buffer_order to match undone text
+			M.buffer_order[swap.pos1], M.buffer_order[swap.pos2] = M.buffer_order[swap.pos2], M.buffer_order[swap.pos1]
+
+			local current_pos = swap.pos1
+
+			local reverse_dir = last_move.direction == "down" and "up" or "down"
+
+			vim.schedule(function()
+				apply_move_to_bufferline(current_pos, reverse_dir)
+			end)
+
+			vim.schedule(function()
+				update_window_title()
+				apply_smart_path_decorations()
+			end)
+			return
+		end
+	end
+
+	-- Handle buffer deletion undo
 	if after_count > before_count then
 		if #M.deleted_buffers > 0 then
 			local deleted = table.remove(M.deleted_buffers)
@@ -281,10 +355,18 @@ local function smart_undo()
 			end
 
 			table.insert(M.buffer_order, deleted.position, new_bufnr)
+
+			vim.schedule(function()
+				update_window_title()
+				apply_smart_path_decorations()
+			end)
+
 			vim.notify("Restored: " .. (deleted.name ~= "" and deleted.name or "[No Name]"), vim.log.levels.INFO)
+			return
 		end
 	end
 
+	-- For text-only undo don't sync buffer_order (causing issues)
 	vim.schedule(function()
 		update_window_title()
 		apply_smart_path_decorations()
@@ -294,12 +376,39 @@ end
 local function smart_redo()
 	local before_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
 	local before_count = #before_lines
+	local before_order = vim.deepcopy(M.buffer_order)
 
 	vim.cmd("silent! redo")
 
 	local after_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
 	local after_count = #after_lines
 
+	-- Check if redoing a move operation
+	if before_count == after_count then
+		local swap = find_swap(before_lines, after_lines, before_order)
+
+		if swap then
+			-- Swap buffer_order to match redone text
+			M.buffer_order[swap.pos1], M.buffer_order[swap.pos2] = M.buffer_order[swap.pos2], M.buffer_order[swap.pos1]
+
+			local move = { from = swap.pos2, direction = "up" }
+			table.insert(M.move_history, move)
+
+			local current_pos = swap.pos1
+
+			vim.schedule(function()
+				apply_move_to_bufferline(current_pos, "up")
+			end)
+
+			vim.schedule(function()
+				update_window_title()
+				apply_smart_path_decorations()
+			end)
+			return
+		end
+	end
+
+	-- Handle buffer deletion redo
 	if after_count < before_count then
 		local deleted_index = 1
 		for i = 1, after_count do
@@ -328,16 +437,23 @@ local function smart_redo()
 			table.insert(M.deleted_buffers, buf_info)
 			pcall(vim.cmd, "bdelete " .. bufnr)
 			table.remove(M.buffer_order, deleted_index)
+
+			vim.schedule(function()
+				update_window_title()
+				apply_smart_path_decorations()
+			end)
+			return
 		end
 	end
 
+	-- For text-only undo don't sync buffer_order (causing issues)
 	vim.schedule(function()
 		update_window_title()
 		apply_smart_path_decorations()
 	end)
 end
 
-function M.save_changes()
+function M.save_changes(skip_confirm)
 	if not M.manager_buf or not api.nvim_buf_is_valid(M.manager_buf) then
 		return
 	end
@@ -361,11 +477,25 @@ function M.save_changes()
 
 	-- Apply changes
 	if #changes > 0 then
+		if M.config.confirm_save and not skip_confirm then
+			local change_summary = "Rename the following buffers?\n\n"
+			for _, change in ipairs(changes) do
+				local old_display = change.old ~= "" and vim.fn.fnamemodify(change.old, ":t") or "[No Name]"
+				change_summary = change_summary .. string.format("  %s → %s\n", old_display, change.new)
+			end
+
+			local choice = vim.fn.confirm(change_summary, "&Yes\n&No", 1)
+			if choice ~= 1 then
+				vim.notify("Save cancelled", vim.log.levels.INFO)
+				return
+			end
+		end
+
 		local success_count = 0
 		for _, change in ipairs(changes) do
 			local old_path = change.old
 			if old_path == "" then
-				-- Buffer has no name, just set new name
+				-- Buffer has no name, set new name
 				local ok = pcall(vim.api.nvim_buf_set_name, change.bufnr, change.new)
 				if ok then
 					success_count = success_count + 1
@@ -410,7 +540,7 @@ function M.save_changes()
 						)
 					end
 				else
-					-- File doesn't exist yet, just update buffer name
+					-- File doesn't exist yet, update buffer name
 					local ok = pcall(vim.api.nvim_buf_set_name, change.bufnr, new_path)
 					if ok then
 						success_count = success_count + 1
@@ -424,15 +554,47 @@ function M.save_changes()
 			vim.notify("Renamed " .. success_count .. " buffer(s)", vim.log.levels.INFO)
 		end
 
-		-- Call refresh with a small delay to avoid conflicts
-		vim.defer_fn(M.refresh_display, 100)
+		apply_smart_path_decorations()
 	else
 		vim.notify("No changes to save", vim.log.levels.INFO)
 	end
 
 	update_window_title()
-
 	vim.bo[M.manager_buf].modified = false
+end
+
+function M.close()
+	local pending = get_pending_changes()
+
+	if #pending > 0 then
+		-- Build change summary
+		local change_summary = "Unsaved changes:\n\n"
+		for _, change in ipairs(pending) do
+			change_summary = change_summary .. string.format("  %s → %s\n", change.old, change.new)
+		end
+		change_summary = change_summary .. "\nSave changes?"
+
+		local choice = vim.fn.confirm(change_summary, "&Yes\n&No\n&Cancel", 1)
+
+		if choice == 1 then
+			-- Yes
+			M.save_changes(true) -- Pass true skips second confirmation
+		elseif choice == 2 then
+			-- No
+		elseif choice == 3 or choice == 0 then
+			-- Cancel or ESC
+			return
+		end
+	end
+
+	if M.manager_win and api.nvim_win_is_valid(M.manager_win) then
+		api.nvim_win_close(M.manager_win, true)
+	end
+	M.manager_win = nil
+	M.manager_buf = nil
+	if M.origin_win and api.nvim_win_is_valid(M.origin_win) then
+		api.nvim_set_current_win(M.origin_win)
+	end
 end
 
 function M.refresh_display()
@@ -467,7 +629,7 @@ function M.refresh_display()
 	M.buffer_order = {}
 
 	for _, b in ipairs(buffers) do
-		-- Use edited line if it exists, otherwise use formatted name
+		-- Use edited line if exists, otherwise use formatted name
 		local display_name
 		if edited_lines[b.bufnr] then
 			display_name = edited_lines[b.bufnr]
@@ -481,7 +643,7 @@ function M.refresh_display()
 	local cursor_pos = api.nvim_win_get_cursor(M.manager_win)
 	api.nvim_buf_set_lines(M.manager_buf, 0, -1, false, buf_lines)
 
-	-- Apply virtual text for duplicate filenames
+	-- Apply virtual text to show dupe filenames
 	apply_smart_path_decorations(buffers)
 
 	if api.nvim_win_is_valid(M.manager_win) then
@@ -498,6 +660,12 @@ end
 
 function M.delete_line()
 	if not M.manager_win or not api.nvim_win_is_valid(M.manager_win) then
+		return
+	end
+
+	-- Check for unsaved changes before deleting
+	if has_unsaved_changes() then
+		vim.notify("Save changes before deleting buffers (Ctrl-S or :w)", vim.log.levels.WARN)
 		return
 	end
 
@@ -533,6 +701,7 @@ function M.delete_line()
 		end
 
 		-- If deleting current buffer, switch to another buffer first
+		-- (prevents some weird display issues in some cases)
 		if is_current then
 			local next_bufnr = nil
 
@@ -565,6 +734,11 @@ function M.move_line_down()
 		return
 	end
 
+	if has_unsaved_changes() then
+		vim.notify("Save changes before moving buffers (Ctrl-S or :w)", vim.log.levels.WARN)
+		return
+	end
+
 	local cursor = api.nvim_win_get_cursor(M.manager_win)
 	local line_num = cursor[1]
 
@@ -574,23 +748,41 @@ function M.move_line_down()
 
 	local bufnr = M.buffer_order[line_num]
 	if bufnr then
+		-- Store move in history for undo/redo
+		table.insert(M.move_history, { from = line_num, direction = "down" })
+
+		-- Get lines that will be swapped for the undo point
+		local current_line = api.nvim_buf_get_lines(M.manager_buf, line_num - 1, line_num, false)[1]
+		local next_line = api.nvim_buf_get_lines(M.manager_buf, line_num, line_num + 1, false)[1]
+
+		-- Perform bufferline move first
 		if M.origin_win and api.nvim_win_is_valid(M.origin_win) then
 			vim.fn.win_execute(M.origin_win, "buffer " .. bufnr)
 			vim.fn.win_execute(M.origin_win, "BufferLineMoveNext")
 		end
 
-		vim.defer_fn(function()
-			M.refresh_display()
-			if api.nvim_win_is_valid(M.manager_win) then
-				cursor[1] = math.min(cursor[1] + 1, #M.buffer_order)
-				pcall(api.nvim_win_set_cursor, M.manager_win, cursor)
-			end
-		end, 50)
+		-- Create separate undo point for each move
+		api.nvim_buf_set_lines(M.manager_buf, line_num - 1, line_num + 1, false, { next_line, current_line })
+
+		-- Update cursor position
+		cursor[1] = math.min(cursor[1] + 1, #M.buffer_order)
+		pcall(api.nvim_win_set_cursor, M.manager_win, cursor)
+
+		-- Update the buffer_order to match
+		M.buffer_order[line_num], M.buffer_order[line_num + 1] = M.buffer_order[line_num + 1], M.buffer_order[line_num]
+
+		apply_smart_path_decorations()
 	end
 end
 
 function M.move_line_up()
 	if not M.manager_win or not api.nvim_win_is_valid(M.manager_win) then
+		return
+	end
+
+	-- Check for unsaved changes before moving
+	if has_unsaved_changes() then
+		vim.notify("Save changes before moving buffers (Ctrl-S or :w)", vim.log.levels.WARN)
 		return
 	end
 
@@ -603,18 +795,30 @@ function M.move_line_up()
 
 	local bufnr = M.buffer_order[line_num]
 	if bufnr then
+		-- Store move in history for undo/redo
+		table.insert(M.move_history, { from = line_num, direction = "up" })
+
+		-- Get lines that will be swapped for the undo point
+		local current_line = api.nvim_buf_get_lines(M.manager_buf, line_num - 1, line_num, false)[1]
+		local prev_line = api.nvim_buf_get_lines(M.manager_buf, line_num - 2, line_num - 1, false)[1]
+
+		-- Perform bufferline move first
 		if M.origin_win and api.nvim_win_is_valid(M.origin_win) then
 			vim.fn.win_execute(M.origin_win, "buffer " .. bufnr)
 			vim.fn.win_execute(M.origin_win, "BufferLineMovePrev")
 		end
 
-		vim.defer_fn(function()
-			M.refresh_display()
-			if api.nvim_win_is_valid(M.manager_win) then
-				cursor[1] = math.max(cursor[1] - 1, 1)
-				pcall(api.nvim_win_set_cursor, M.manager_win, cursor)
-			end
-		end, 50)
+		-- Create separate undo point for each move
+		api.nvim_buf_set_lines(M.manager_buf, line_num - 2, line_num, false, { current_line, prev_line })
+
+		-- Update cursor position
+		cursor[1] = math.max(cursor[1] - 1, 1)
+		pcall(api.nvim_win_set_cursor, M.manager_win, cursor)
+
+		-- Update the buffer_order to match
+		M.buffer_order[line_num], M.buffer_order[line_num - 1] = M.buffer_order[line_num - 1], M.buffer_order[line_num]
+
+		apply_smart_path_decorations()
 	end
 end
 
@@ -636,43 +840,10 @@ function M.jump_to_buffer()
 	end
 end
 
-function M.close()
-	local pending = get_pending_changes()
-
-	if #pending > 0 then
-		-- Build change summary
-		local change_summary = "Unsaved changes:\n\n"
-		for _, change in ipairs(pending) do
-			change_summary = change_summary .. string.format("  %s → %s\n", change.old, change.new)
-		end
-		change_summary = change_summary .. "\nSave changes?"
-
-		local choice = vim.fn.confirm(change_summary, "&Yes\n&No\n&Cancel", 1)
-
-		if choice == 1 then
-			-- Yes - Save and close
-			M.save_changes()
-		elseif choice == 2 then
-			-- No - Close without saving
-		elseif choice == 3 or choice == 0 then
-			-- Cancel or ESC - Don't close
-			return
-		end
-	end
-
-	if M.manager_win and api.nvim_win_is_valid(M.manager_win) then
-		api.nvim_win_close(M.manager_win, true)
-	end
-	M.manager_win = nil
-	M.manager_buf = nil
-	if M.origin_win and api.nvim_win_is_valid(M.origin_win) then
-		api.nvim_set_current_win(M.origin_win)
-	end
-end
-
 function M.open()
 	M.origin_win = api.nvim_get_current_win()
 	M.deleted_buffers = {}
+	M.move_history = {}
 
 	local buffers = get_bufferline_order()
 	local buf_lines = {}
@@ -741,6 +912,18 @@ function M.open()
 	-- Apply virtual text for dupe filenames
 	apply_smart_path_decorations(buffers)
 
+	-- Auto-save on leaving insert mode (if enabled)
+	if M.config.auto_save_on_exit_insert then
+		vim.api.nvim_create_autocmd("InsertLeave", {
+			buffer = M.manager_buf,
+			callback = function()
+				if has_unsaved_changes() then
+					M.save_changes()
+				end
+			end,
+		})
+	end
+
 	-- Handle text changes and undo/redo
 	vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
 		buffer = M.manager_buf,
@@ -752,12 +935,12 @@ function M.open()
 			local current_lines = api.nvim_buf_get_lines(M.manager_buf, 0, -1, false)
 			local expected_count = #M.buffer_order
 
-			-- Check if line count changed
 			if #current_lines ~= expected_count then
 				-- Check if undo is trying to restore a deleted buffer's line
 				if #current_lines > expected_count then
-					-- Lines were added (likely from undo)
-					-- Refresh to the current state - don't allow undo of deletions
+					-- Lines were added (must be from undo/redo)
+					--TODO: rework through this logic, we can undo buffer deletion now, but this
+					-- error message still triggers sometimes, debug why
 					vim.notify("Cannot undo buffer deletion. Buffer is already closed.", vim.log.levels.WARN)
 					M.refresh_display()
 				elseif #current_lines < expected_count then
@@ -796,33 +979,6 @@ function M.open()
 
 	local opts_key = { noremap = true, silent = true, buffer = M.manager_buf }
 
-	--TODO: not actually necessary because of how we save now and check for errors now
-	-- Block line deletion commands (use dd keymap instead)
-	-- local block_delete_keys = { "d", "D", "x", "X", "s", "S" }
-	-- for _, key in ipairs(block_delete_keys) do
-	-- 	vim.keymap.set("n", key, function()
-	-- 		vim.notify("Use '" .. M.config.keymaps.delete .. "' to delete buffers", vim.log.levels.WARN)
-	-- 	end, vim.tbl_extend("force", opts_key, { desc = "Blocked - use " .. M.config.keymaps.delete }))
-	-- end
-
-	-- Block change commands that would delete
-	-- vim.keymap.set("n", "c", function()
-	-- 	vim.notify("Use 'cw' or 'C' to edit buffer name", vim.log.levels.WARN)
-	-- end, vim.tbl_extend("force", opts_key, { desc = "Blocked - use cw or C" }))
-
-	-- Block visual mode deletion
-	-- vim.keymap.set("v", "d", function()
-	-- 	vim.notify("Cannot delete lines. Use '" .. M.config.keymaps.delete .. "' in normal mode", vim.log.levels.WARN)
-	-- end, vim.tbl_extend("force", opts_key, { desc = "Blocked" }))
-
-	-- vim.keymap.set("v", "c", function()
-	-- 	vim.notify("Cannot delete lines. Use '" .. M.config.keymaps.delete .. "' in normal mode", vim.log.levels.WARN)
-	-- end, vim.tbl_extend("force", opts_key, { desc = "Blocked" }))
-
-	-- Allow editing with cw and C
-	-- vim.keymap.set("n", "cw", "0C", vim.tbl_extend("force", opts_key, { desc = "Edit buffer name" }))
-	-- vim.keymap.set("n", "C", "0C", vim.tbl_extend("force", opts_key, { desc = "Edit buffer name" }))
-
 	-- Block new line below
 	vim.keymap.set("n", "o", function()
 		vim.notify("Cannot add new buffers here", vim.log.levels.WARN)
@@ -856,12 +1012,12 @@ function M.open()
 	-- Smart undo
 	vim.keymap.set("n", "u", function()
 		smart_undo()
-	end, vim.tbl_extend("force", opts_key, { desc = "Smart undo (text only)" }))
+	end, vim.tbl_extend("force", opts_key, { desc = "Undo" }))
 
 	-- Smart redo
 	vim.keymap.set("n", "<C-r>", function()
 		smart_redo()
-	end, vim.tbl_extend("force", opts_key, { desc = "Smart redo (text only)" }))
+	end, vim.tbl_extend("force", opts_key, { desc = "Redo" }))
 
 	-- Close keymaps
 	local close_keys = type(M.config.keymaps.close) == "table" and M.config.keymaps.close or { M.config.keymaps.close }
@@ -871,10 +1027,11 @@ function M.open()
 		end, vim.tbl_extend("force", opts_key, { desc = "Close manager" }))
 	end
 
+	-- TODO: get rid of this to allow replace in buffer
 	-- Refresh keymap
-	vim.keymap.set("n", M.config.keymaps.refresh, function()
-		M.refresh_display()
-	end, vim.tbl_extend("force", opts_key, { desc = "Refresh" }))
+	-- vim.keymap.set("n", M.config.keymaps.refresh, function()
+	-- 	M.refresh_display()
+	-- end, vim.tbl_extend("force", opts_key, { desc = "Refresh" }))
 
 	-- Save keymap (normal)
 	vim.keymap.set("n", M.config.keymaps.save, function()
